@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: price-tracker-bot
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+    envVars:
+      - key: BOT_TOKEN
+        value: YOUR_BOT_TOKEN_HERE   # ← حط التوكن هنا
+      - key: CHAT_ID
+        value: YOUR_CHAT_ID_HERE     # ← حط الـ chat_id بتاعك هنا
+      - key: PORT
+        value: 8080
