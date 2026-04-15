@@ -1,3 +1,8 @@
+if 'amazon' in text.lower() or 'noon' in text.lower():
+        return
+    
+    if not context.user_data.get('waiting_target'):
+        return
 import asyncio
 import os
 import logging
