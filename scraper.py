@@ -1,257 +1,278 @@
+"""
+Amazon Price Scraper
+Supports: amazon.eg, .com, .sa, .ae, .co.uk, .de, .fr, .it, .es, .co.jp, .ca, amzn.to
+"""
 import re
-import json
 import time
+import random
 import logging
-import cloudscraper
+import requests
 from bs4 import BeautifulSoup
-from urllib.parse import urlparse, urlencode, parse_qs
+from urllib.parse import urlparse, urljoin
 
 logger = logging.getLogger(__name__)
 
-_scraper = cloudscraper.create_scraper(
-    browser={'browser': 'chrome', 'platform': 'windows', 'mobile': False}
+AMAZON_DOMAINS = re.compile(
+    r"(amazon\.(com|eg|sa|ae|co\.uk|de|fr|it|es|co\.jp|ca|com\.au|com\.br|in|"
+    r"com\.mx|nl|pl|se|com\.tr|be|sg|com\.sg)|amzn\.(to|eu|asia))",
+    re.I
 )
 
-HEADERS = {
-    'Accept-Language': 'ar-EG,ar;q=0.9,en-US;q=0.8,en;q=0.7',
-    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-    'Accept-Encoding': 'gzip, deflate, br',
-    'Connection': 'keep-alive',
-    'DNT': '1',
-    'Upgrade-Insecure-Requests': '1',
-    'Cache-Control': 'max-age=0',
-    'sec-ch-ua': '"Chromium";v="122", "Not(A:Brand";v="24", "Google Chrome";v="122"',
-    'sec-ch-ua-mobile': '?0',
-    'sec-ch-ua-platform': '"Windows"',
-    'Sec-Fetch-Dest': 'document',
-    'Sec-Fetch-Mode': 'navigate',
-    'Sec-Fetch-Site': 'none',
-    'Sec-Fetch-User': '?1',
+CURRENCY_MAP = {
+    "amazon.eg":     "EGP",
+    "amazon.sa":     "SAR",
+    "amazon.ae":     "AED",
+    "amazon.com":    "USD",
+    "amazon.co.uk":  "GBP",
+    "amazon.de":     "EUR",
+    "amazon.fr":     "EUR",
+    "amazon.it":     "EUR",
+    "amazon.es":     "EUR",
+    "amazon.co.jp":  "JPY",
+    "amazon.ca":     "CAD",
+    "amazon.com.au": "AUD",
+    "amazon.in":     "INR",
+    "amazon.com.br": "BRL",
+    "amazon.nl":     "EUR",
 }
 
-# ─── URL Cleaning ─────────────────────────────────────────────────────────────
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36 Edg/123.0.0.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4_1) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4.1 Safari/605.1.15",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0",
+]
 
-def extract_asin(url: str) -> str | None:
-    """Extract ASIN from any Amazon URL format."""
-    # /dp/ASIN or /gp/product/ASIN or /product/ASIN
-    patterns = [
-        r'/dp/([A-Z0-9]{10})',
-        r'/gp/product/([A-Z0-9]{10})',
-        r'/product/([A-Z0-9]{10})',
-        r'[?&]asin=([A-Z0-9]{10})',
-    ]
-    for pat in patterns:
-        m = re.search(pat, url, re.IGNORECASE)
-        if m:
-            return m.group(1).upper()
-    return None
 
-def clean_amazon_url(url: str) -> str:
-    """Return clean product URL from any Amazon URL. Falls back to original."""
-    asin = extract_asin(url)
-    if asin:
-        # Build clean URL - no tracking params
-        return f"https://www.amazon.eg/dp/{asin}"
-    return url
+class AmazonScraper:
 
-def clean_noon_url(url: str) -> str:
-    """Strip tracking params from Noon URL."""
-    try:
-        parsed = urlparse(url)
-        # Keep only path, no query
-        return f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
-    except Exception:
-        return url
+    def __init__(self):
+        self.session = requests.Session()
 
-def detect_platform(url: str) -> str | None:
-    u = url.lower()
-    if 'amazon' in u:
-        return 'amazon'
-    if 'noon' in u:
-        return 'noon'
-    return None
+    def is_amazon_url(self, url: str) -> bool:
+        try:
+            return bool(AMAZON_DOMAINS.search(urlparse(url).netloc))
+        except Exception:
+            return False
 
-# ─── Price parser ─────────────────────────────────────────────────────────────
+    def _resolve_short_url(self, url: str) -> str:
+        """Expand amzn.to and similar short URLs"""
+        try:
+            r = self.session.head(url, allow_redirects=True, timeout=10)
+            return r.url
+        except Exception:
+            return url
 
-def parse_price(text: str) -> float | None:
-    if not text:
-        return None
-    try:
-        cleaned = re.sub(r'[^\d.,]', '', text.strip())
-        if ',' in cleaned and '.' in cleaned:
-            cleaned = cleaned.replace(',', '')
-        elif ',' in cleaned and cleaned.index(',') < len(cleaned) - 3:
-            cleaned = cleaned.replace(',', '')
-        elif ',' in cleaned:
-            cleaned = cleaned.replace(',', '.')
-        val = float(cleaned)
-        return val if val > 0 else None
-    except Exception:
+    def extract_asin(self, url: str) -> str | None:
+        patterns = [
+            r"/dp/([A-Z0-9]{10})",
+            r"/gp/product/([A-Z0-9]{10})",
+            r"/product/([A-Z0-9]{10})",
+            r"/ASIN/([A-Z0-9]{10})",
+            r"[?&]asin=([A-Z0-9]{10})",
+        ]
+        for pat in patterns:
+            m = re.search(pat, url, re.I)
+            if m:
+                return m.group(1).upper()
         return None
 
-# ─── Amazon ───────────────────────────────────────────────────────────────────
-
-def scrape_amazon(url: str, retries: int = 3) -> tuple[str | None, float | None]:
-    clean_url = clean_amazon_url(url)
-    asin = extract_asin(url)
-    logger.info(f"Amazon scraping: {clean_url} (ASIN: {asin})")
-
-    for attempt in range(retries):
+    def _get_currency(self, url: str, soup: BeautifulSoup) -> str:
         try:
-            if attempt > 0:
-                time.sleep(2 * attempt)
+            parsed  = urlparse(url)
+            domain  = parsed.netloc.lower().replace("www.", "")
+            if domain in CURRENCY_MAP:
+                return CURRENCY_MAP[domain]
+        except Exception:
+            pass
+        # Try to extract from page
+        for sel in ["#corePriceDisplay_desktop_feature_div .a-price-symbol",
+                    ".a-price-symbol"]:
+            el = soup.select_one(sel)
+            if el:
+                sym = el.get_text(strip=True)
+                sym_map = {"$": "USD", "£": "GBP", "€": "EUR", "¥": "JPY",
+                           "₹": "INR", "ج.م": "EGP", "ر.س": "SAR", "د.إ": "AED"}
+                if sym in sym_map:
+                    return sym_map[sym]
+        return "USD"
 
-            resp = _scraper.get(clean_url, headers=HEADERS, timeout=15)
-
-            # Detect block
-            if resp.status_code == 503 or 'Robot Check' in resp.text or 'api-services-support' in resp.text:
-                logger.warning(f"Amazon blocked (attempt {attempt+1})")
-                continue
-
-            soup = BeautifulSoup(resp.text, 'lxml')
-
-            # ── Name ──
-            name = None
-            for tag, attrs in [
-                ('span', {'id': 'productTitle'}),
-                ('h1',   {'class': re.compile(r'title', re.I)}),
-            ]:
-                el = soup.find(tag, attrs)
-                if el:
-                    name = el.get_text(strip=True)[:120]
-                    break
-
-            # ── Price (multiple strategies) ──
-            price = None
-
-            # Strategy 1: .a-offscreen (most reliable)
-            for el in soup.find_all('span', {'class': 'a-offscreen'}):
-                p = parse_price(el.get_text())
-                if p and p > 10:
-                    price = p
-                    break
-
-            # Strategy 2: whole + fraction
-            if not price:
-                whole = soup.find('span', {'class': 'a-price-whole'})
-                frac  = soup.find('span', {'class': 'a-price-fraction'})
-                if whole:
-                    raw = whole.get_text(strip=True).replace(',', '').rstrip('.')
-                    if frac:
-                        raw += '.' + frac.get_text(strip=True)
-                    price = parse_price(raw)
-
-            # Strategy 3: legacy price blocks
-            if not price:
-                for pid in ('priceblock_ourprice', 'priceblock_dealprice', 'priceblock_saleprice'):
-                    el = soup.find(id=pid)
-                    if el:
-                        price = parse_price(el.get_text())
-                        if price:
-                            break
-
-            # Strategy 4: JSON-LD
-            if not price:
-                for script in soup.find_all('script', type='application/ld+json'):
-                    try:
-                        data = json.loads(script.string or '{}')
-                        offers = data.get('offers', {})
-                        if isinstance(offers, list):
-                            offers = offers[0]
-                        p = offers.get('price')
-                        if p:
-                            price = float(p)
-                            break
-                    except Exception:
-                        pass
-
-            if price:
-                return name, price
-
-        except Exception as e:
-            logger.error(f"Amazon attempt {attempt+1} error: {e}")
-
-    return None, None
-
-# ─── Noon ─────────────────────────────────────────────────────────────────────
-
-def scrape_noon(url: str, retries: int = 3) -> tuple[str | None, float | None]:
-    clean_url = clean_noon_url(url)
-    logger.info(f"Noon scraping: {clean_url}")
-
-    for attempt in range(retries):
+    def _parse_price(self, text: str) -> float | None:
+        """Extract numeric price from text like '1,299.99' or '1.299,99'"""
+        if not text:
+            return None
+        # Remove currency symbols and spaces
+        cleaned = re.sub(r"[^\d.,]", "", text.strip())
+        if not cleaned:
+            return None
+        # Handle formats: 1,299.99 or 1.299,99
+        if "," in cleaned and "." in cleaned:
+            if cleaned.rindex(".") > cleaned.rindex(","):
+                cleaned = cleaned.replace(",", "")
+            else:
+                cleaned = cleaned.replace(".", "").replace(",", ".")
+        elif "," in cleaned:
+            parts = cleaned.split(",")
+            if len(parts) == 2 and len(parts[1]) <= 2:
+                cleaned = cleaned.replace(",", ".")
+            else:
+                cleaned = cleaned.replace(",", "")
         try:
-            if attempt > 0:
-                time.sleep(2 * attempt)
+            return float(cleaned)
+        except ValueError:
+            return None
 
-            resp = _scraper.get(clean_url, headers=HEADERS, timeout=15)
-            soup = BeautifulSoup(resp.text, 'lxml')
+    def _extract_price_from_soup(self, soup: BeautifulSoup) -> float | None:
+        """Try multiple selectors to find price"""
+        # Priority selectors — most reliable first
+        selectors = [
+            # Core price (main buy box)
+            "#corePriceDisplay_desktop_feature_div .a-offscreen",
+            "#corePrice_desktop .a-offscreen",
+            "#price_inside_buybox",
+            "#priceblock_ourprice",
+            "#priceblock_dealprice",
+            "#priceblock_saleprice",
+            # Newer layout
+            ".a-price.a-text-price.a-size-medium .a-offscreen",
+            ".reinventPricePriceToPayMargin .a-offscreen",
+            "#apex_desktop .a-offscreen",
+            # Fresh/pantry
+            "#freshPriceblock_ourprice",
+            "#pantryPrice_ourprice",
+            # Offer price
+            ".a-price .a-offscreen",
+            "#price .a-offscreen",
+            "span.a-price > span.a-offscreen",
+            # Deal price
+            "#dealprice_shippingmessage .a-color-price",
+        ]
+        for sel in selectors:
+            el = soup.select_one(sel)
+            if el:
+                price = self._parse_price(el.get_text(strip=True))
+                if price and price > 0:
+                    logger.debug(f"  Price found via selector: {sel} → {price}")
+                    return price
 
-            name  = None
-            price = None
+        # Fallback: JSON-LD structured data
+        for tag in soup.find_all("script", type="application/ld+json"):
+            try:
+                import json
+                data = json.loads(tag.string or "")
+                if isinstance(data, dict):
+                    offers = data.get("offers", {})
+                    if isinstance(offers, list):
+                        offers = offers[0]
+                    p = offers.get("price") or data.get("price")
+                    if p:
+                        price = self._parse_price(str(p))
+                        if price and price > 0:
+                            return price
+            except Exception:
+                pass
 
-            # Strategy 1: __NEXT_DATA__
-            next_script = soup.find('script', {'id': '__NEXT_DATA__'})
-            if next_script:
-                try:
-                    data  = json.loads(next_script.string or '{}')
-                    props = data.get('props', {}).get('pageProps', {})
-                    for path in [['product'], ['catalogItem'], ['item'], ['data', 'product']]:
-                        node = props
-                        for key in path:
-                            node = node.get(key, {}) if isinstance(node, dict) else {}
-                        if isinstance(node, dict) and node:
-                            name  = node.get('name') or node.get('title') or node.get('displayName')
-                            price = node.get('price') or node.get('salePrice') or node.get('currentPrice')
-                            if name or price:
-                                break
-                    if isinstance(price, (int, float)):
-                        price = float(price)
-                    elif isinstance(price, str):
-                        price = parse_price(price)
-                    if name:
-                        name = str(name)[:120]
-                except Exception as e:
-                    logger.warning(f"Noon JSON parse error: {e}")
+        return None
 
-            # Strategy 2: HTML fallback
-            if not name:
-                h1 = soup.find('h1')
-                if h1:
-                    name = h1.get_text(strip=True)[:120]
+    def _extract_title(self, soup: BeautifulSoup) -> str:
+        selectors = [
+            "#productTitle",
+            "#title span",
+            "h1.a-size-large span",
+            "h1 span#productTitle",
+        ]
+        for sel in selectors:
+            el = soup.select_one(sel)
+            if el:
+                return el.get_text(strip=True)
+        return "Unknown Product"
 
-            if not price:
-                for qa in ('price', 'priceNow', 'sale-price'):
-                    el = soup.find(attrs={'data-qa': qa})
-                    if el:
-                        price = parse_price(el.get_text())
-                        if price:
-                            break
+    def _check_availability(self, soup: BeautifulSoup) -> bool:
+        unavail_selectors = [
+            "#availability span.a-color-price",
+            "#outOfStock",
+        ]
+        for sel in unavail_selectors:
+            el = soup.select_one(sel)
+            if el and any(kw in el.get_text().lower() for kw in
+                          ["unavailable", "غير متاح", "out of stock", "currently unavailable"]):
+                return False
+        avail_el = soup.select_one("#availability span")
+        if avail_el:
+            text = avail_el.get_text(strip=True).lower()
+            if any(kw in text for kw in ["in stock", "متاح", "available", "توصيل"]):
+                return True
+            if any(kw in text for kw in ["out of stock", "غير متاح", "unavailable"]):
+                return False
+        return True  # Assume available if unclear
 
-            if not price:
-                for el in soup.find_all(class_=re.compile(r'\bprice\b', re.I)):
-                    p = parse_price(el.get_text())
-                    if p and 5 < p < 200_000:
-                        price = p
-                        break
+    def get_product(self, url: str, retries: int = 3) -> dict | None:
+        # Resolve short URLs
+        if re.search(r"amzn\.(to|eu|asia)", url, re.I):
+            url = self._resolve_short_url(url)
 
-            if price:
-                return name, price
+        asin = self.extract_asin(url)
 
-        except Exception as e:
-            logger.error(f"Noon attempt {attempt+1} error: {e}")
+        for attempt in range(retries):
+            try:
+                ua = random.choice(USER_AGENTS)
+                headers = {
+                    "User-Agent": ua,
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+                    "Accept-Language": "en-US,en;q=0.9,ar;q=0.8",
+                    "Accept-Encoding": "gzip, deflate, br",
+                    "DNT": "1",
+                    "Connection": "keep-alive",
+                    "Upgrade-Insecure-Requests": "1",
+                    "Sec-Fetch-Dest": "document",
+                    "Sec-Fetch-Mode": "navigate",
+                    "Sec-Fetch-Site": "none",
+                    "Cache-Control": "max-age=0",
+                }
 
-    return None, None
+                time.sleep(random.uniform(1.5, 3.5))
+                resp = self.session.get(url, headers=headers, timeout=20, allow_redirects=True)
 
-# ─── Public API ───────────────────────────────────────────────────────────────
+                if resp.status_code == 503:
+                    logger.warning(f"  503 on attempt {attempt+1}, retrying...")
+                    time.sleep(5 * (attempt + 1))
+                    continue
 
-def get_price(url: str) -> tuple[str | None, float | None, str | None]:
-    """Returns (name, price, platform)."""
-    platform = detect_platform(url)
-    if platform == 'amazon':
-        name, price = scrape_amazon(url)
-        return name, price, 'amazon'
-    elif platform == 'noon':
-        name, price = scrape_noon(url)
-        return name, price, 'noon'
-    return None, None, None
+                if resp.status_code != 200:
+                    logger.warning(f"  HTTP {resp.status_code} for {url[:60]}")
+                    continue
+
+                soup = BeautifulSoup(resp.text, "html.parser")
+
+                # Check if Amazon blocked us (CAPTCHA page)
+                if soup.find("form", {"action": "/errors/validateCaptcha"}):
+                    logger.warning(f"  CAPTCHA on attempt {attempt+1}")
+                    time.sleep(10)
+                    continue
+
+                title     = self._extract_title(soup)
+                price     = self._extract_price_from_soup(soup)
+                currency  = self._get_currency(url, soup)
+                available = self._check_availability(soup)
+
+                logger.info(f"  ✅ {title[:50]} | {price} {currency}")
+                return {
+                    "title":     title,
+                    "price":     price,
+                    "currency":  currency,
+                    "available": available,
+                    "asin":      asin,
+                    "url":       url,
+                }
+
+            except requests.exceptions.Timeout:
+                logger.warning(f"  Timeout on attempt {attempt+1}")
+                time.sleep(3)
+            except Exception as e:
+                logger.error(f"  Error on attempt {attempt+1}: {e}")
+                time.sleep(3)
+
+        logger.error(f"  Failed after {retries} attempts: {url[:60]}")
+        return None
